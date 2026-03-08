@@ -2,6 +2,7 @@ import os
 import time
 import hashlib
 import requests
+import feedparser
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 
@@ -13,7 +14,7 @@ JST = timezone(timedelta(hours=9))
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Sources (start small & stable)
-JHA_NEWS_URL = "https://en.hockey.or.jp/news/"
+JHA_FEED_URL = "https://en.hockey.or.jp/feed/"
 FIH_NEWS_URL = "https://www.fih.hockey/news"
 
 # ---------------------------
@@ -47,26 +48,19 @@ def take_text(soup: BeautifulSoup, max_chars: int = 5000) -> str:
 # Scrape sources
 # ---------------------------
 def scrape_jha(limit: int = 8):
-    soup = fetch_html(JHA_NEWS_URL)
+    feed = feedparser.parse(JHA_FEED_URL)
     items = []
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        title = a.get_text(" ", strip=True)
-
-        if not href or not title or len(title) < 10:
+    for e in feed.entries[:limit * 2]:
+        title = (getattr(e, "title", "") or "").strip()
+        link = (getattr(e, "link", "") or "").strip()
+        if not title or not link:
             continue
-
-        if href.startswith("/"):
-            href = "https://en.hockey.or.jp" + href
-
-        # Heuristic: keep only news/article pages
-        if href.startswith("https://en.hockey.or.jp/") and ("/news" in href):
-            items.append({
-                "region": "Japan",
-                "source_name": "JHA",
-                "title": title,
-                "url": norm_url(href),
-            })
+        items.append({
+            "region": "Japan",
+            "source_name": "JHA",
+            "title": title,
+            "url": norm_url(link),
+        })
 
     # dedupe by URL
     seen = set()
