@@ -236,7 +236,7 @@ URL: {url}
     jp_summary = (parsed.get("jp_summary") or "").strip()
 
     if not jp_title:
-        jp_title = title[:40]
+        jp_title = "（タイトル生成失敗）" + title[:30]
     if not jp_summary:
         jp_summary = "要約の生成に失敗しました。"
 
