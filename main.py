@@ -1,6 +1,6 @@
 import os
 import time
-import hashlib
+import json
 import requests
 import feedparser
 from bs4 import BeautifulSoup
@@ -22,6 +22,10 @@ UA_HEADERS = {
 JHA_FEED_URL = "https://en.hockey.or.jp/feed/"
 FIH_NEWS_URL = "https://www.fih.hockey/news"
 
+# Notion に「Original Title」列があるなら True
+# ないなら False のままでOK
+USE_ORIGINAL_TITLE_COLUMN = False
+
 
 # ---------------------------
 # Helpers
@@ -29,10 +33,6 @@ FIH_NEWS_URL = "https://www.fih.hockey/news"
 def norm_url(url: str) -> str:
     url = (url or "").strip()
     return url[:-1] if url.endswith("/") else url
-
-
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
 def fetch_html(url: str) -> BeautifulSoup:
@@ -56,6 +56,32 @@ def take_text(soup: BeautifulSoup, max_chars: int = 5000) -> str:
     return joined[:max_chars].strip()
 
 
+def extract_json_object(text: str) -> dict:
+    """
+    Gemini が ```json ... ``` 付きで返したり、前後に余計な文字を付けても
+    できるだけ JSON を取り出す。
+    """
+    if not text:
+        raise ValueError("empty response")
+
+    s = text.strip()
+
+    # ```json ... ``` 対応
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if len(lines) >= 3:
+            s = "\n".join(lines[1:-1]).strip()
+
+    # 先頭の { から末尾の } までを抜く
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or start >= end:
+        raise ValueError(f"JSON object not found: {text}")
+
+    s = s[start:end + 1]
+    return json.loads(s)
+
+
 # ---------------------------
 # Scrape sources
 # ---------------------------
@@ -63,7 +89,7 @@ def scrape_jha(limit: int = 8):
     """JHA: use RSS feed to avoid 403 from GitHub Actions runners."""
     feed = feedparser.parse(JHA_FEED_URL)
     items = []
-    for e in feed.entries[:limit * 3]:
+    for e in feed.entries[: limit * 3]:
         title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()
         if not title or not link:
@@ -128,34 +154,48 @@ def scrape_fih(limit: int = 8):
 
 
 # ---------------------------
-# Gemini summary
+# Gemini summary / title
 # ---------------------------
 def post_with_backoff(url, headers, json_payload, timeout=60, max_retries=6):
     wait = 2
-    for i in range(max_retries):
+    last_response = None
+    for _ in range(max_retries):
         r = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
+        last_response = r
         if r.status_code != 429:
             return r
-        # 429: rate limit -> wait and retry
         time.sleep(wait)
         wait = min(wait * 2, 60)
-    return r
+    return last_response
 
-def gemini_summarize(title: str, region: str, source_name: str, url: str, body: str) -> str:
+
+def gemini_generate_japanese_fields(
+    title: str, region: str, source_name: str, url: str, body: str
+) -> dict:
     prompt = f"""
 あなたはフィールドホッケーのニュース要約アシスタントです。
-以下の情報を日本語で要約してください。
+次の情報から、日本語タイトルと日本語要約を作ってください。
+
+出力は必ず JSON のみ。
+説明文やコードブロックは不要です。
+
+{{
+  "jp_title": "...",
+  "jp_summary": "..."
+}}
 
 要件:
-- 2〜4文
-- 100〜180字程度
+- jp_title: 40文字以内、日本語、自然なニュース見出し
+- 固有名詞は必要なら英語のままで可
+- jp_summary: 2〜4文、100〜180字程度、日本語
 - 「何が起きたか」「なぜ注目か」を含める
 - 本文が短い/不十分なら推測しすぎない
 - 誇張しない
+- 原文の意味から大きく外れない
 
 地域: {region}
 ソース: {source_name}
-タイトル: {title}
+タイトル(原文): {title}
 URL: {url}
 
 本文:
@@ -167,19 +207,43 @@ URL: {url}
         "gemini-2.5-flash:generateContent"
     )
 
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
     r = post_with_backoff(
         f"{endpoint}?key={GEMINI_API_KEY}",
         headers={"Content-Type": "application/json"},
-        json_payload={"contents": [{"parts": [{"text": prompt}]}]},
+        json_payload=payload,
         timeout=60,
         max_retries=8,
     )
     r.raise_for_status()
+
     data = r.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        return "要約の生成に失敗しました。"
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        raise RuntimeError(f"Gemini response parse error: {e}, raw={data}")
+
+    parsed = extract_json_object(text)
+
+    jp_title = (parsed.get("jp_title") or "").strip()
+    jp_summary = (parsed.get("jp_summary") or "").strip()
+
+    if not jp_title:
+        jp_title = title[:40]
+    if not jp_summary:
+        jp_summary = "要約の生成に失敗しました。"
+
+    return {
+        "jp_title": jp_title[:2000],
+        "jp_summary": jp_summary[:2000],
+    }
 
 
 # ---------------------------
@@ -202,7 +266,6 @@ def notion_query_existing_urls():
 
     r = requests.post(endpoint, headers=notion_headers(), json=payload, timeout=30)
     if not r.ok:
-        # This prints the real reason for 400 (property name mismatch etc.)
         print("Notion query error:", r.status_code, r.text)
     r.raise_for_status()
 
@@ -219,16 +282,25 @@ def notion_query_existing_urls():
 def notion_create_page(item):
     today = datetime.now(JST).date().isoformat()
 
+    properties = {
+        # Notion の Title には日本語タイトルを入れる
+        "Title": {"title": [{"text": {"content": item["jp_title"][:2000]}}]},
+        "Date": {"date": {"start": today}},
+        "Region": {"select": {"name": item["region"]}},
+        "Summary": {"rich_text": [{"text": {"content": item["jp_summary"][:2000]}}]},
+        "Source URL": {"url": item["url"]},
+        "Source Name": {"rich_text": [{"text": {"content": item["source_name"][:2000]}}]},
+    }
+
+    # 原文タイトル列を使いたい場合
+    if USE_ORIGINAL_TITLE_COLUMN:
+        properties["Original Title"] = {
+            "rich_text": [{"text": {"content": item["title"][:2000]}}]
+        }
+
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": {
-            "Title": {"title": [{"text": {"content": item["title"][:2000]}}]},
-            "Date": {"date": {"start": today}},
-            "Region": {"select": {"name": item["region"]}},
-            "Summary": {"rich_text": [{"text": {"content": item["summary"][:2000]}}]},
-            "Source URL": {"url": item["url"]},
-            "Source Name": {"rich_text": [{"text": {"content": item["source_name"][:2000]}}]},
-        },
+        "properties": properties,
     }
 
     r = requests.post(
@@ -275,8 +347,17 @@ def main():
         except Exception as e:
             body = f"(本文取得失敗: {e})"
 
-        # summarize
-        it["summary"] = gemini_summarize(it["title"], it["region"], it["source_name"], it["url"], body)
+        # generate jp_title / jp_summary
+        try:
+            gen = gemini_generate_japanese_fields(
+                it["title"], it["region"], it["source_name"], it["url"], body
+            )
+            it["jp_title"] = gen["jp_title"]
+            it["jp_summary"] = gen["jp_summary"]
+        except Exception as e:
+            print("Gemini generation error:", e)
+            it["jp_title"] = it["title"][:40]
+            it["jp_summary"] = "要約の生成に失敗しました。"
 
         # write to Notion
         notion_create_page(it)
