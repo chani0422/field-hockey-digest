@@ -130,6 +130,17 @@ def scrape_fih(limit: int = 8):
 # ---------------------------
 # Gemini summary
 # ---------------------------
+def post_with_backoff(url, headers, json_payload, timeout=60, max_retries=6):
+    wait = 2
+    for i in range(max_retries):
+        r = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
+        if r.status_code != 429:
+            return r
+        # 429: rate limit -> wait and retry
+        time.sleep(wait)
+        wait = min(wait * 2, 60)
+    return r
+
 def gemini_summarize(title: str, region: str, source_name: str, url: str, body: str) -> str:
     prompt = f"""
 あなたはフィールドホッケーのニュース要約アシスタントです。
@@ -156,11 +167,12 @@ URL: {url}
         "gemini-2.5-flash:generateContent"
     )
 
-    r = requests.post(
+    r = post_with_backoff(
         f"{endpoint}?key={GEMINI_API_KEY}",
         headers={"Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}]},
+        json_payload={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=60,
+        max_retries=8,
     )
     r.raise_for_status()
     data = r.json()
@@ -244,7 +256,7 @@ def main():
     items = list(tmp.values())
 
     # cap daily posts
-    items = items[:8]
+    items = items[:2]
 
     # prevent duplicates in Notion (recent 100)
     existing_urls = notion_query_existing_urls()
