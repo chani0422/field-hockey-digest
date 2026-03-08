@@ -11,11 +11,17 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 JST = timezone(timedelta(hours=9))
-UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Sources (start small & stable)
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
+
+# Sources
 JHA_FEED_URL = "https://en.hockey.or.jp/feed/"
 FIH_NEWS_URL = "https://www.fih.hockey/news"
+
 
 # ---------------------------
 # Helpers
@@ -24,43 +30,52 @@ def norm_url(url: str) -> str:
     url = (url or "").strip()
     return url[:-1] if url.endswith("/") else url
 
+
 def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+
 def fetch_html(url: str) -> BeautifulSoup:
+    """Fetch HTML and return BeautifulSoup. Raise on HTTP errors."""
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
+
 def take_text(soup: BeautifulSoup, max_chars: int = 5000) -> str:
-    # Grab meaningful paragraphs
     ps = []
+    total = 0
     for p in soup.select("p"):
         t = p.get_text(" ", strip=True)
         if len(t) >= 40:
             ps.append(t)
-        if sum(len(x) for x in ps) >= max_chars:
+            total += len(t)
+        if total >= max_chars:
             break
     joined = "\n".join(ps)
     return joined[:max_chars].strip()
+
 
 # ---------------------------
 # Scrape sources
 # ---------------------------
 def scrape_jha(limit: int = 8):
+    """JHA: use RSS feed to avoid 403 from GitHub Actions runners."""
     feed = feedparser.parse(JHA_FEED_URL)
     items = []
-    for e in feed.entries[:limit * 2]:
+    for e in feed.entries[:limit * 3]:
         title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()
         if not title or not link:
             continue
-        items.append({
-            "region": "Japan",
-            "source_name": "JHA",
-            "title": title,
-            "url": norm_url(link),
-        })
+        items.append(
+            {
+                "region": "Japan",
+                "source_name": "JHA",
+                "title": title,
+                "url": norm_url(link),
+            }
+        )
 
     # dedupe by URL
     seen = set()
@@ -73,6 +88,7 @@ def scrape_jha(limit: int = 8):
         if len(out) >= limit:
             break
     return out
+
 
 def scrape_fih(limit: int = 8):
     soup = fetch_html(FIH_NEWS_URL)
@@ -87,15 +103,18 @@ def scrape_fih(limit: int = 8):
         if href.startswith("/"):
             href = "https://www.fih.hockey" + href
 
-        # Heuristic: keep only FIH news article pages
+        # Keep only FIH news article pages
         if href.startswith("https://www.fih.hockey/") and "/news/" in href:
-            items.append({
-                "region": "Overseas",
-                "source_name": "FIH",
-                "title": title,
-                "url": norm_url(href),
-            })
+            items.append(
+                {
+                    "region": "Overseas",
+                    "source_name": "FIH",
+                    "title": title,
+                    "url": norm_url(href),
+                }
+            )
 
+    # dedupe by URL
     seen = set()
     out = []
     for it in items:
@@ -106,6 +125,7 @@ def scrape_fih(limit: int = 8):
         if len(out) >= limit:
             break
     return out
+
 
 # ---------------------------
 # Gemini summary
@@ -149,6 +169,7 @@ URL: {url}
     except Exception:
         return "要約の生成に失敗しました。"
 
+
 # ---------------------------
 # Notion API
 # ---------------------------
@@ -159,16 +180,20 @@ def notion_headers():
         "Content-Type": "application/json",
     }
 
-def notion_query_existing_urls(urls):
-    """Return set of URLs already in DB to prevent duplicates."""
-    existing = set()
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
 
-    # Notion filter can't do "in" list for URL reliably, so we fetch recent pages and compare.
-    # Keep it simple: grab up to 100 recent entries.
-    payload = {"page_size": 100, "sorts": [{"property": "Date", "direction": "descending"}]}
-    r = requests.post(url, headers=notion_headers(), json=payload, timeout=30)
+def notion_query_existing_urls():
+    """Return set of URLs already in DB to prevent duplicates (recent 100)."""
+    existing = set()
+    endpoint = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    payload = {"page_size": 100}
+
+    r = requests.post(endpoint, headers=notion_headers(), json=payload, timeout=30)
+    if not r.ok:
+        # This prints the real reason for 400 (property name mismatch etc.)
+        print("Notion query error:", r.status_code, r.text)
     r.raise_for_status()
+
     results = r.json().get("results", [])
     for page in results:
         props = page.get("properties", {})
@@ -177,6 +202,7 @@ def notion_query_existing_urls(urls):
         if u:
             existing.add(norm_url(u))
     return existing
+
 
 def notion_create_page(item):
     today = datetime.now(JST).date().isoformat()
@@ -193,8 +219,16 @@ def notion_create_page(item):
         },
     }
 
-    r = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=payload, timeout=30)
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=notion_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if not r.ok:
+        print("Notion create page error:", r.status_code, r.text)
     r.raise_for_status()
+
 
 # ---------------------------
 # Main
@@ -213,7 +247,7 @@ def main():
     items = items[:8]
 
     # prevent duplicates in Notion (recent 100)
-    existing_urls = notion_query_existing_urls([it["url"] for it in items])
+    existing_urls = notion_query_existing_urls()
 
     posted = 0
     for it in items:
@@ -238,6 +272,7 @@ def main():
         time.sleep(1)  # gentle rate limit
 
     print(f"Done. Posted {posted} new items.")
+
 
 if __name__ == "__main__":
     main()
